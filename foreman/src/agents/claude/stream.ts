@@ -4,16 +4,8 @@ import type { Foreman } from '../../foreman.js';
 import { firstLine, headLines, tailLines, truncate } from '../../util/text.js';
 import { relPath, toolActivity } from '../activity.js';
 
-export interface TurnStats {
-  sessionId?: string;
-  resultText?: string;
-  subtype?: string;
-  isError: boolean;
-  costUsd?: number;
-  numTurns?: number;
-  authFailed?: string;
-  errors: string[];
-}
+import type { TurnStats } from '../engine.js';
+export type { TurnStats };
 
 interface Block {
   type: string;
@@ -88,6 +80,8 @@ function diffFromInput(tool: string, input: Record<string, unknown>, cwd: string
 export class StreamMapper {
   private toolNames = new Map<string, string>();
   readonly stats: TurnStats = { isError: false, errors: [] };
+  /** the model the CLI reported at init */
+  model: string | undefined;
 
   constructor(
     private fm: Foreman,
@@ -104,6 +98,7 @@ export class StreamMapper {
         const m = msg as { subtype?: string; session_id?: string; model?: string };
         if (m.subtype === 'init' && m.session_id) {
           this.stats.sessionId = m.session_id;
+          if (m.model) this.model = m.model;
           fm.log.debug(`${id}: session ${m.session_id} (${m.model ?? '?'})`);
         }
         break;
