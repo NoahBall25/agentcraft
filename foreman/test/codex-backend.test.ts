@@ -65,8 +65,9 @@ const readLog = (file: string): LogLine[] =>
  * A Codex worker's writable roots: objects, its own worktree git dir, temp, and only its own
  * branches' refs and reflogs. Never the shared .git (config, hooks, other branches).
  */
+// git reports real paths (macOS's /var is /private/var), so expect those
 const gitRoots = (repo: string, worktreeId: string, agent: string) => [
-  path.join(repo, '.git', 'objects'),
+  path.join((repo = fs.realpathSync(repo)), '.git', 'objects'),
   path.join(repo, '.git', 'worktrees', worktreeId),
   os.tmpdir(),
   path.join(repo, '.git', 'refs', 'heads', 'agentcraft', agent),

@@ -375,7 +375,8 @@ const rows: Row[] = [
   ['ps set-content inside', 'PowerShell', { command: 'Set-Content -Path src/x.ts -Value hi' }, worker, 'allow'],
   ['ps set-content positional', 'PowerShell', { command: 'Set-Content src/x.ts "hi there"' }, worker, 'allow'],
   ['ps out-file outside', 'PowerShell', { command: 'Get-Content src/cli.ts | Out-File ../../outside.txt' }, worker, 'ask'],
-  ['ps set-content outside', 'PowerShell', { command: 'Set-Content -Path C:/Windows/x.txt -Value hi' }, worker, 'ask'],
+  ['ps set-content outside', 'PowerShell', { command: 'Set-Content -Path C:/Windows/x.txt -Value hi' }, worker, process.platform === 'win32' ? 'ask' : 'allow'],
+  ['ps set-content outside (posix)', 'PowerShell', { command: 'Set-Content -Path /etc/x.txt -Value hi' }, worker, 'ask'],
   ['ps lead filters', 'PowerShell', { command: 'Get-ChildItem src -Recurse | Select-Object FullName' }, lead, 'allow'],
   ['ps lead set-content', 'PowerShell', { command: 'Set-Content -Path src/x.ts -Value hi' }, lead, 'ask'],
 ];
