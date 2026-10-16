@@ -41,6 +41,7 @@ import { fetchPulls, githubOrigin, prRefs, pullBriefs, type PullRequest } from '
 import type { Engine, EngineId, PermissionGate, Role, TurnStats } from './engine.js';
 import { agentTools, type ToolHooks, type TurnHandle } from './tools.js';
 import { modelLabel } from './models.js';
+import { limitBlockedReason, limitResetFrom, RESET_GRACE_MS, retryAtFromReason } from './usagelimit.js';
 import { userName } from '../user.js';
 
 // policy: our own team tools are trusted (the Claude engine exposes them as this MCP server)
@@ -96,6 +97,8 @@ interface Running {
 }
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+/** Local wall-clock time for messages, e.g. "9:42 PM". */
+const clock = (at: Date) => at.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
 
 function alive(child: ChildProcess | undefined): child is ChildProcess {
   return !!child && child.exitCode === null && child.signalCode === null;
@@ -168,6 +171,8 @@ export class TeamBackend implements Backend {
   /** scheduler retry after an error (backoff) */
   private retryTimer: NodeJS.Timeout | undefined;
   private retryDelayMs = 2000;
+  /** retries waiting for a usage limit to reset, by task id (workers) or 'lead' */
+  private limitTimers = new Map<string, NodeJS.Timeout>();
   private readonly pullFetcher: PullFetcher;
   /** the model each agent's last turn really ran (shown on its nameplate) */
   private reportedModels = new Map<string, { engine: EngineId; label: string }>();
@@ -275,6 +280,10 @@ export class TeamBackend implements Backend {
       this.st.inflight = {};
     } else {
       this.recover();
+    }
+    for (const t of this.fm.tasks.list()) {
+      const at = t.status === 'blocked' ? retryAtFromReason(t.blockedReason) : undefined;
+      if (at) this.scheduleTaskRetry(t.id, at);
     }
     // the user's messages that no agent read before the restart
     for (const id of [LEAD, ...this.team]) this.deliverPending(id);
@@ -400,6 +409,8 @@ export class TeamBackend implements Backend {
     this.stopping = true;
     if (this.tickTimer) clearTimeout(this.tickTimer);
     if (this.retryTimer) clearTimeout(this.retryTimer);
+    for (const t of this.limitTimers.values()) clearTimeout(t);
+    this.limitTimers.clear();
     const turns = [...this.running.values()];
     for (const r of turns) this.abortTurn(r, 'shutdown');
     await Promise.race([Promise.allSettled([...this.turnPromises]), sleep(4000)]);
@@ -906,12 +917,44 @@ export class TeamBackend implements Backend {
 
   // ---- after a turn -------------------------------------------------------------------------
 
+  /** Run `fn` once the usage limit resets (plus a grace period; at once if it already has); replaces an earlier wait under the same key. */
+  private scheduleLimit(key: string, at: Date, fn: () => void): void {
+    const old = this.limitTimers.get(key);
+    if (old) clearTimeout(old);
+    const timer = setTimeout(() => {
+      this.limitTimers.delete(key);
+      if (this.stopping) return;
+      fn();
+      this.tick();
+    }, at.getTime() > Date.now() ? at.getTime() + RESET_GRACE_MS - Date.now() : 0);
+    timer.unref?.();
+    this.limitTimers.set(key, timer);
+  }
+
+  /** Queue a task blocked by the usage limit again after the reset, unless someone already moved it. */
+  private scheduleTaskRetry(taskId: string, at: Date): void {
+    this.scheduleLimit(`task:${taskId}`, at, () => {
+      const t = this.fm.tasks.get(taskId);
+      if (!t || t.status !== 'blocked' || !retryAtFromReason(t.blockedReason)) return;
+      this.fm.tasks.update(t.id, { ci: 'unknown', blockedReason: null });
+      this.fm.tasks.setStatus(t.id, 'todo', { force: true });
+      this.fm.bus.feed('task', `Task ${t.id} queued again: the Claude usage limit has reset`, { agentId: t.assignee ?? LEAD });
+    });
+  }
+
   private failure(stats: TurnStats | undefined): string {
     return truncate(stats?.subtype && stats.subtype !== 'success' ? stats.subtype.replace(/^error_/, '').replace(/_/g, ' ') : (stats?.errors[0] ?? 'error'), 36);
   }
 
   private async afterTurn(job: Job, stats: TurnStats | undefined): Promise<void> {
     const failed = !stats || stats.isError;
+    const reset = failed ? limitResetFrom([...(stats?.errors ?? []), stats?.resultText]) : undefined;
+    if (job.agentId === LEAD && reset) {
+      this.fm.setAgent(LEAD, { state: 'blocked', station: 'meeting', activity: `usage limit - back at ${clock(reset)}` });
+      this.fm.bus.feed('error', `Marlow hit the Claude usage limit; his ${job.kind} turn runs again after it resets (${clock(reset)})`, { agentId: LEAD });
+      this.scheduleLimit('lead', reset, () => this.enqueue({ ...job, fresh: false, resumed: true }));
+      return;
+    }
     if (job.agentId === LEAD) {
       this.fm.setAgent(LEAD, failed ? { state: 'error', station: 'meeting', activity: `turn failed: ${this.failure(stats)}` } : { state: 'idle', station: 'meeting', activity: 'watching the task wall' });
       // any lead turn for a goal that is still planning (plan, or a plan resumed after a
@@ -961,6 +1004,12 @@ export class TeamBackend implements Backend {
       if (!failed && wt && wt.files > 0) {
         this.fm.tasks.setStatus(t.id, 'review', { summary: truncate(stats?.resultText ?? 'work complete', 400) });
         await this.afterWorkerDone(t.id);
+      } else if (reset) {
+        // the usage limit, not the task, stopped it: park it and retry once the limit resets
+        this.fm.tasks.setStatus(t.id, 'blocked', { reason: limitBlockedReason(reset), force: true });
+        this.fm.setAgent(job.agentId, { state: 'blocked', station: 'desk', activity: `${t.id}: usage limit - back at ${clock(reset)}` });
+        this.fm.notify('warn', `${this.fm.nameOf(job.agentId)}: ${t.id} paused by the Claude usage limit - retrying automatically after ${clock(reset)}`);
+        this.scheduleTaskRetry(t.id, reset);
       } else {
         this.fm.tasks.setStatus(t.id, 'blocked', { reason: failed ? `session ended: ${stats?.subtype ?? stats?.errors.join('; ') ?? 'error'}` : 'worker stopped without changes', force: true });
         // a failed turn is an error (red); a worker that gave up is blocked
